@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+# AdHocMPD — "DJ Drop-In" ad-hoc interrupt & resume for Music Player Daemon (MPD)
+# https://github.com/applutan/adhocmpd
+#
+# Saves active queue and playback position, plays a requested track to completion,
+# and restores the previous queue and position.
+
+set -euo pipefail
+
+# Default configuration values
+DEFAULT_HOST="localhost"
+DEFAULT_PORT="6600"
+DEFAULT_PASSWORD=""
+
+CONFIG_FILE=""
+JSON_OUTPUT=0
+ASYNC_MODE=0
+
+usage() {
+    cat <<EOF
+AdHocMPD — Ad-hoc drop-in interrupt & resume for Music Player Daemon (MPD)
+
+Usage: $(basename "$0") [OPTIONS] "<search query or track name>"
+
+Interrupts the current MPD playback to play a requested track,
+then automatically restores the previous queue, track index, and position.
+
+Options:
+  -c, --config FILE        Load custom configuration file
+  -h, --host HOST          MPD host address (default: \$MPD_HOST, config, or '${DEFAULT_HOST}')
+  -p, --port PORT          MPD port (default: \$MPD_PORT, config, or ${DEFAULT_PORT})
+  -P, --password PASSWORD  MPD password (default: \$MPD_PASSWORD or config)
+  -j, --json               Output structured JSON (ideal for HA pipelines / APIs)
+  -a, --async              Detach restore watcher to background (returns immediately to caller)
+  -v, --version            Display version information and exit
+  --help                   Show this help message and exit
+
+Configuration files loaded in order of priority:
+  1. CLI arguments (-h, -p, -P)
+  2. Environment variables (\$MPD_HOST, \$MPD_PORT, \$MPD_PASSWORD)
+  3. Custom file specified via -c/--config
+  4. ~/.config/adhocmpd/config or ~/.adhocmpd.conf
+  5. /etc/adhocmpd.conf
+
+Examples:
+  $(basename "$0") "Oh Caroline"
+  $(basename "$0") -j "Oh Caroline"
+  $(basename "$0") -j -a "Roadwalkermash"
+  $(basename "$0") -h 192.168.1.50 -P mysecret "Goldberg Variations"
+EOF
+    exit 0
+}
+
+version() {
+    echo "AdHocMPD version 1.0.0"
+    exit 0
+}
+
+# 1. Load system and user configuration files if present
+for cfg in "/etc/adhocmpd.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/adhocmpd/config" "$HOME/.adhocmpd.conf"; do
+    if [ -f "$cfg" ]; then
+        # shellcheck source=/dev/null
+        source "$cfg"
+    fi
+done
+
+# 2. Command-line argument parsing
+CLI_HOST=""
+CLI_PORT=""
+CLI_PASSWORD=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--config)
+            CONFIG_FILE="$2"
+            shift 2
+            ;;
+        -h|--host)
+            CLI_HOST="$2"
+            shift 2
+            ;;
+        -p|--port)
+            CLI_PORT="$2"
+            shift 2
+            ;;
+        -P|--password)
+            CLI_PASSWORD="$2"
+            shift 2
+            ;;
+        -j|--json)
+            JSON_OUTPUT=1
+            shift
+            ;;
+        -a|--async)
+            ASYNC_MODE=1
+            shift
+            ;;
+        -v|--version)
+            version
+            ;;
+        --help)
+            usage
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ -n "$CONFIG_FILE" ]; then
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    else
+        echo "Error: Configuration file '$CONFIG_FILE' not found." >&2
+        exit 1
+    fi
+fi
+
+if [ $# -eq 0 ]; then
+    echo "Error: Missing search term or track name." >&2
+    usage
+fi
+
+QUERY="$*"
+
+# Resolve configuration precedence: CLI > ENV > Config file > Default
+MPD_HOST="${CLI_HOST:-${MPD_HOST:-$DEFAULT_HOST}}"
+MPD_PORT="${CLI_PORT:-${MPD_PORT:-$DEFAULT_PORT}}"
+MPD_PASSWORD="${CLI_PASSWORD:-${MPD_PASSWORD:-$DEFAULT_PASSWORD}}"
+
+log() {
+    if [ "$JSON_OUTPUT" -eq 0 ]; then
+        echo "$@"
+    else
+        echo "$@" >&2
+    fi
+}
+
+# If password is set and not already embedded in MPD_HOST, format as password@host
+if [ -n "$MPD_PASSWORD" ] && [[ "$MPD_HOST" != *"@"* ]]; then
+    MPD_HOST="${MPD_PASSWORD}@${MPD_HOST}"
+fi
+export MPD_HOST MPD_PORT
+
+if ! command -v mpc >/dev/null 2>&1; then
+    echo "Error: 'mpc' client is not installed. Please install it (e.g. sudo apt install mpc)." >&2
+    exit 1
+fi
+
+log "[1/5] Checking MPD connection at ${MPD_HOST#*@}:${MPD_PORT}..."
+if ! mpc status >/dev/null 2>&1; then
+    echo "Error: Unable to authenticate or connect to MPD at ${MPD_HOST#*@}:${MPD_PORT}." >&2
+    exit 1
+fi
+
+# Function to search library with smart phonetic/word fallbacks
+find_best_track() {
+    local q="$1"
+    local results=""
+
+    # 1. Exact query match
+    results=$(mpc search any "$q" 2>/dev/null || true)
+    if [ -n "$results" ]; then
+        echo "$results"
+        return 0
+    fi
+
+    # 2. Phonetic 'Oh ' -> 'O ' normalization (common in voice STT like "Oh Caroline")
+    local q_norm
+    q_norm=$(echo "$q" | sed -E 's/\b[Oo]h\b/O/g')
+    if [ "$q_norm" != "$q" ]; then
+        results=$(mpc search any "$q_norm" 2>/dev/null || true)
+        if [ -n "$results" ]; then
+            echo "$results"
+            return 0
+        fi
+    fi
+
+    # 3. Strip leading articles: "The ", "A ", "An "
+    local q_no_art
+    q_no_art=$(echo "$q" | sed -E 's/^(The|A|An) //i')
+    if [ "$q_no_art" != "$q" ]; then
+        results=$(mpc search any "$q_no_art" 2>/dev/null || true)
+        if [ -n "$results" ]; then
+            echo "$results"
+            return 0
+        fi
+    fi
+
+    # 4. Multi-word AND search across all significant words (>=3 chars)
+    local search_args=()
+    for word in $q; do
+        local clean_word
+        clean_word=$(echo "$word" | tr -d '[:punct:]')
+        if [ ${#clean_word} -ge 3 ] && [[ ! "$clean_word" =~ ^(The|And|For|With)$ ]]; then
+            search_args+=(any "$clean_word")
+        fi
+    done
+
+    if [ ${#search_args[@]} -gt 0 ]; then
+        results=$(mpc search "${search_args[@]}" 2>/dev/null || true)
+        if [ -n "$results" ]; then
+            echo "$results"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+log "[2/5] Searching library for: '$QUERY'..."
+MATCHES=$(find_best_track "$QUERY" || true)
+
+if [ -z "$MATCHES" ]; then
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        if command -v jq >/dev/null 2>&1; then
+            jq -n --arg q "$QUERY" '{"status":"error", "message": ("No tracks matching \u0027" + $q + "\u0027 found in library.")}'
+        else
+            echo "{\"status\":\"error\",\"message\":\"No tracks matching '$QUERY' found in library.\"}"
+        fi
+    else
+        echo "Error: No matching tracks found in library for '$QUERY'." >&2
+    fi
+    exit 1
+fi
+
+TOTAL_MATCHES=$(echo "$MATCHES" | wc -l)
+SELECTED_TRACK=$(echo "$MATCHES" | head -n 1)
+
+if [ "$TOTAL_MATCHES" -gt 1 ]; then
+    log "  Found $TOTAL_MATCHES matches. Selected top result:"
+    log "  -> $SELECTED_TRACK"
+else
+    log "  -> Selected: $SELECTED_TRACK"
+fi
+
+# Detect current track details
+CURRENT_TRACK=$(mpc current 2>/dev/null || true)
+STATUS_TEXT=$(mpc status || true)
+if [ -z "$CURRENT_TRACK" ]; then
+    CURRENT_TRACK=$(echo "$STATUS_TEXT" | head -n 1)
+fi
+
+ELAPSED=$(echo "$STATUS_TEXT" | awk '/\[playing\]/ {print $3}' | cut -d/ -f1 || true)
+CURRENT_POS=$(echo "$STATUS_TEXT" | awk '/\[playing\]/ {print $2}' | tr -d '#' | cut -d/ -f1 || true)
+TOTAL_QUEUE=$(echo "$STATUS_TEXT" | awk '/\[playing\]/ {print $2}' | tr -d '#' | cut -d/ -f2 || echo "0")
+
+WAS_PLAYING=0
+if echo "$STATUS_TEXT" | grep -q '\[playing\]'; then
+    WAS_PLAYING=1
+fi
+
+log "[3/5] Freezing current session:"
+log "      Track:    '${CURRENT_TRACK:-[None]}'"
+log "      Position: #${CURRENT_POS:-0}/${TOTAL_QUEUE:-0} (Elapsed: ${ELAPSED:-0:00})"
+
+# Capture player playback modes
+WAS_REPEAT=$(echo "$STATUS_TEXT" | grep -o 'repeat: [a-z]*' | cut -d' ' -f2 || echo "off")
+WAS_RANDOM=$(echo "$STATUS_TEXT" | grep -o 'random: [a-z]*' | cut -d' ' -f2 || echo "off")
+WAS_SINGLE=$(echo "$STATUS_TEXT" | grep -o 'single: [a-z]*' | cut -d' ' -f2 || echo "off")
+WAS_CONSUME=$(echo "$STATUS_TEXT" | grep -o 'consume: [a-z]*' | cut -d' ' -f2 || echo "off")
+
+# Snapshot active queue to temporary playlist
+TEMP_PLAYLIST="__dropin_temp_${RANDOM}_$(date +%s)__"
+mpc rm "$TEMP_PLAYLIST" 2>/dev/null || true
+mpc save "$TEMP_PLAYLIST" >/dev/null
+
+# Helper for resolving drop-in display title
+DROPIN_TITLE=$(mpc search -f "%artist% - %title%" file "$SELECTED_TRACK" 2>/dev/null | head -n 1 || true)
+if [ -z "$DROPIN_TITLE" ] || [ "$DROPIN_TITLE" = " - " ]; then
+    DROPIN_TITLE="$SELECTED_TRACK"
+fi
+
+# Construct concise TTS message for voice pipelines
+TTS_MSG="Interrupting '${CURRENT_TRACK}' to play '${DROPIN_TITLE}'. Resuming at ${ELAPSED:-the start} afterwards."
+
+# Function to execute session restoration
+perform_restore() {
+    log ""
+    log "Restoring previous session: '${CURRENT_TRACK}' (#${CURRENT_POS:-?} at ${ELAPSED:-0:00})..."
+    mpc clear >/dev/null 2>&1 || true
+    mpc load "$TEMP_PLAYLIST" >/dev/null 2>&1 || true
+    mpc rm "$TEMP_PLAYLIST" >/dev/null 2>&1 || true
+
+    # Restore playback modes
+    [ -n "$WAS_REPEAT" ] && mpc repeat "$WAS_REPEAT" >/dev/null 2>&1 || true
+    [ -n "$WAS_RANDOM" ] && mpc random "$WAS_RANDOM" >/dev/null 2>&1 || true
+    [ -n "$WAS_SINGLE" ] && mpc single "$WAS_SINGLE" >/dev/null 2>&1 || true
+    [ -n "$WAS_CONSUME" ] && mpc consume "$WAS_CONSUME" >/dev/null 2>&1 || true
+
+    if [ "$WAS_PLAYING" -eq 1 ] && [ -n "$CURRENT_POS" ]; then
+        mpc play "$CURRENT_POS" >/dev/null 2>&1 || true
+        if [ -n "$ELAPSED" ]; then
+            mpc seek "$ELAPSED" >/dev/null 2>&1 || true
+        fi
+        log "Done. Session resumed at track #${CURRENT_POS} (${ELAPSED})."
+    else
+        log "Done. Queue restored."
+    fi
+}
+
+log "[4/5] Interrupting playback to play drop-in track..."
+mpc clear >/dev/null
+mpc add "$SELECTED_TRACK" >/dev/null
+
+# Disable repeat so playback stops naturally when this track ends
+mpc repeat off >/dev/null
+mpc single off >/dev/null
+mpc play 1 >/dev/null
+
+log "Playing: $DROPIN_TITLE"
+
+emit_json() {
+    local status="$1"
+    local async_flag="$2"
+    if command -v jq >/dev/null 2>&1; then
+        jq -n \
+          --arg status "$status" \
+          --arg async "$async_flag" \
+          --arg int_track "$CURRENT_TRACK" \
+          --arg int_pos "${CURRENT_POS:-0}" \
+          --arg int_elapsed "${ELAPSED:-0:00}" \
+          --arg int_total "${TOTAL_QUEUE:-0}" \
+          --arg drop_track "$DROPIN_TITLE" \
+          --arg drop_file "$SELECTED_TRACK" \
+          --arg query "$QUERY" \
+          --arg tts "$TTS_MSG" \
+          '{
+            status: $status,
+            async: ($async == "true"),
+            interrupted: {
+              track: $int_track,
+              position: ($int_pos | tonumber),
+              elapsed: $int_elapsed,
+              playlist_length: ($int_total | tonumber)
+            },
+            dropin: {
+              track: $drop_track,
+              file: $drop_file,
+              query: $query
+            },
+            tts_message: $tts
+          }'
+    else
+        cat <<JSON
+{"status":"$status","async":$async_flag,"interrupted":{"track":"$CURRENT_TRACK","position":${CURRENT_POS:-0},"elapsed":"$ELAPSED","playlist_length":${TOTAL_QUEUE:-0}},"dropin":{"track":"$DROPIN_TITLE","file":"$SELECTED_TRACK","query":"$QUERY"},"tts_message":"$TTS_MSG"}
+JSON
+    fi
+}
+
+if [ "$ASYNC_MODE" -eq 1 ]; then
+    # In async mode, emit JSON immediately and fork the restoration monitor into the background
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        emit_json "playing" "true"
+    else
+        echo "Drop-in running in background. Session will restore automatically upon completion."
+    fi
+
+    # Detached background watcher
+    (
+        while mpc status 2>/dev/null | grep -q '\[playing\]'; do
+            mpc idle player >/dev/null 2>&1 || sleep 1
+        done
+        # Restore session
+        mpc clear >/dev/null 2>&1 || true
+        mpc load "$TEMP_PLAYLIST" >/dev/null 2>&1 || true
+        mpc rm "$TEMP_PLAYLIST" >/dev/null 2>&1 || true
+        [ -n "$WAS_REPEAT" ] && mpc repeat "$WAS_REPEAT" >/dev/null 2>&1 || true
+        [ -n "$WAS_RANDOM" ] && mpc random "$WAS_RANDOM" >/dev/null 2>&1 || true
+        [ -n "$WAS_SINGLE" ] && mpc single "$WAS_SINGLE" >/dev/null 2>&1 || true
+        [ -n "$WAS_CONSUME" ] && mpc consume "$WAS_CONSUME" >/dev/null 2>&1 || true
+        if [ "$WAS_PLAYING" -eq 1 ] && [ -n "$CURRENT_POS" ]; then
+            mpc play "$CURRENT_POS" >/dev/null 2>&1 || true
+            if [ -n "$ELAPSED" ]; then
+                mpc seek "$ELAPSED" >/dev/null 2>&1 || true
+            fi
+        fi
+    ) >/dev/null 2>&1 &
+    disown
+    exit 0
+fi
+
+# Synchronous mode: register trap for interactive aborts (Ctrl+C)
+trap perform_restore EXIT INT TERM
+
+log "(Press Ctrl+C at any time to cancel drop-in and resume previous session)"
+
+# Wait for playback of the drop-in track to complete while showing live progress
+while mpc status 2>/dev/null | grep -q '\[playing\]'; do
+    PROGRESS=$(mpc status 2>/dev/null | awk '/\[playing\]/ {print $3, $4}' || true)
+    if [ -n "$PROGRESS" ] && [ "$JSON_OUTPUT" -eq 0 ]; then
+        printf "\r  ⏱ Progress: %-30s" "$PROGRESS"
+    fi
+    sleep 1
+done
+
+if [ "$JSON_OUTPUT" -eq 0 ]; then
+    printf "\r%-40s\r" ""
+fi
+
+log "[5/5] Track completed."
+
+if [ "$JSON_OUTPUT" -eq 1 ]; then
+    emit_json "completed" "false"
+fi

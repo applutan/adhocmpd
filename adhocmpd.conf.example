@@ -1,0 +1,11 @@
+# AdHocMPD Configuration File Example
+# Copy to ~/.config/adhocmpd/config or /etc/adhocmpd.conf
+
+# MPD Server hostname or IP address (default: localhost)
+MPD_HOST="localhost"
+
+# MPD Server TCP port (default: 6600)
+MPD_PORT="6600"
+
+# MPD Server password (leave empty if your MPD server does not require one)
+MPD_PASSWORD=""

@@ -1,0 +1,16 @@
+# Local environment & secrets
+*.local
+*.secret
+.env
+.env.*
+
+# AdHocMPD local configs
+config
+*.conf
+!adhocmpd.conf.example
+
+# OS & Editor artifacts
+.DS_Store
+*~
+*.swp
+*.bak
